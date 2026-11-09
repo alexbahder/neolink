@@ -4,12 +4,14 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
 use gstreamer_app::{AppSrc, AppSrcCallbacks, AppStreamType};
+use gstreamer_rtsp_server::{prelude::*, RTSPMedia};
 use neolink_core::{
     bc_protocol::StreamKind,
     bcmedia::model::{
         BcMedia, BcMediaIframe, BcMediaInfoV1, BcMediaInfoV2, BcMediaPframe, VideoType,
     },
 };
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
 
 use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
@@ -160,6 +162,14 @@ const STREAM_LEARN_TIMEOUT: Duration = Duration::from_secs(10);
 /// away without the camera sending another frame.
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Backoff between attempts to resubscribe to the camera after its stream
+/// ends while a client is still watching. Doubles up to the max.
+const RESUBSCRIBE_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const RESUBSCRIBE_BACKOFF_MAX: Duration = Duration::from_secs(10);
+/// Longest wait for one resubscribe attempt, so the pusher keeps checking
+/// whether its client is still there while the camera is unreachable.
+const RESUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// True while an appsrc is still attached to a live pipeline.
 fn source_alive(src: &AppSrc) -> bool {
     let element: &Element = src.upcast_ref();
@@ -171,6 +181,31 @@ fn sources_alive(vid: &Option<AppSrc>, aud: &Option<AppSrc>) -> bool {
     vid.as_ref().is_some_and(source_alive) || aud.as_ref().is_some_and(source_alive)
 }
 
+/// The media that a pipeline ends up in. It is filled in by the factory's
+/// media-configure handler, which runs after the pipeline has been built.
+type MediaSlot = Arc<OnceLock<gstreamer::glib::WeakRef<RTSPMedia>>>;
+
+/// Runs when a frame pusher exits, however it exits. Nothing will feed this
+/// media again, so end its streams and stop handing it to new clients;
+/// otherwise the shared media stays cached and every later client joins a
+/// pipeline that never gets another frame.
+struct PusherExit {
+    vid_src: Option<AppSrc>,
+    aud_src: Option<AppSrc>,
+    media: MediaSlot,
+}
+
+impl Drop for PusherExit {
+    fn drop(&mut self) {
+        for src in self.vid_src.iter().chain(self.aud_src.iter()) {
+            let _ = src.end_of_stream();
+        }
+        if let Some(media) = self.media.get().and_then(|media| media.upgrade()) {
+            media.set_shared(false);
+        }
+    }
+}
+
 enum ClientMsg {
     NewClient {
         element: Element,
@@ -178,6 +213,7 @@ enum ClientMsg {
         /// waited on from the gst-rtsp-server client thread, which is not a
         /// tokio thread, and `recv_timeout` needs no runtime handle.
         reply: std::sync::mpsc::SyncSender<Element>,
+        media: MediaSlot,
     },
 }
 
@@ -192,7 +228,11 @@ pub(super) async fn make_factory(
 
         while let Some(msg) = client_rx.recv().await {
             match msg {
-                ClientMsg::NewClient { element, reply } => {
+                ClientMsg::NewClient {
+                    element,
+                    reply,
+                    media,
+                } => {
                     log::debug!("New client for {name}::{stream}");
                     let camera = camera.clone();
                     let name = name.clone();
@@ -201,7 +241,6 @@ pub(super) async fn make_factory(
                         log::trace!("{name}::{stream}: Starting camera");
 
                         // Start the camera
-                        let config = camera.config().await?.borrow().clone();
                         let mut media_rx = camera.stream_while_live(stream).await?;
 
                         log::trace!("{name}::{stream}: Learning camera stream type");
@@ -255,8 +294,14 @@ pub(super) async fn make_factory(
                                 AnyResult::Ok(Some(src))
                             }
                             None => {
-                                build_unknown(&element, &config.splash_pattern.to_string())?;
-                                AnyResult::Ok(None)
+                                // A splash here would be cached as the shared
+                                // media and end after its test buffers, so
+                                // every later client would get a dead stream.
+                                // Refuse this client instead; it will retry.
+                                log::warn!(
+                                    "{name}::{stream}: No video while learning stream format; refusing client"
+                                );
+                                return AnyResult::Ok(());
                             }
                         }?;
 
@@ -308,8 +353,17 @@ pub(super) async fn make_factory(
                         // async context, so block_on is safe here.
                         let runtime = tokio::runtime::Handle::current();
                         std::thread::spawn(move || {
+                            let _exit = PusherExit {
+                                vid_src: vid_src.clone(),
+                                aud_src: aud_src.clone(),
+                                media,
+                            };
                             let mut clock = MediaClock::new(stream_config.fps);
                             let mut stats = TsStats::new(format!("{name}::{stream}"));
+                            // P-frames are dropped until a keyframe has been
+                            // pushed: at start, after any dropped frame and
+                            // after resubscribing to the camera.
+                            let mut need_keyframe = true;
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
@@ -320,11 +374,17 @@ pub(super) async fn make_factory(
                                     &mut clock,
                                     &stream_config,
                                     &mut stats,
+                                    &mut need_keyframe,
                                 )?;
                             }
 
                             log::trace!("{name}::{stream}: Sending new frames");
-                            loop {
+                            let mut backoff = RESUBSCRIBE_BACKOFF_MIN;
+                            // The pipeline is still NULL while gst-rtsp-server
+                            // prepares it, so only a pipeline that has been
+                            // live and then went back to NULL counts as gone.
+                            let mut was_live = false;
+                            'frames: loop {
                                 // Bounded wait so that a client that has gone
                                 // away is noticed even if the camera has also
                                 // stopped sending. An unbounded blocking_recv
@@ -334,8 +394,50 @@ pub(super) async fn make_factory(
                                     tokio::time::timeout(IDLE_CHECK_INTERVAL, media_rx.recv()).await
                                 });
                                 let data = match next {
-                                    Ok(Some(data)) => data,
-                                    Ok(None) => break,
+                                    Ok(Some(data)) => {
+                                        backoff = RESUBSCRIBE_BACKOFF_MIN;
+                                        data
+                                    }
+                                    Ok(None) => {
+                                        // The camera side ended (relogin,
+                                        // dropped connection) but the client
+                                        // is still watching. Subscribe again
+                                        // rather than leave it on a media
+                                        // that will never get another frame.
+                                        loop {
+                                            std::thread::sleep(backoff);
+                                            backoff = (backoff * 2).min(RESUBSCRIBE_BACKOFF_MAX);
+                                            if !sources_alive(&vid_src, &aud_src) {
+                                                break 'frames;
+                                            }
+                                            // Bounded, so a client that leaves
+                                            // while the camera is offline is
+                                            // still noticed on the next pass.
+                                            match runtime.block_on(tokio::time::timeout(
+                                                RESUBSCRIBE_TIMEOUT,
+                                                camera.stream_while_live(stream),
+                                            )) {
+                                                Ok(Ok(new_rx)) => {
+                                                    log::debug!(
+                                                        "{name}::{stream}: Camera stream resubscribed"
+                                                    );
+                                                    media_rx = new_rx;
+                                                    need_keyframe = true;
+                                                    continue 'frames;
+                                                }
+                                                Ok(Err(e)) => {
+                                                    log::debug!(
+                                                        "{name}::{stream}: Camera stream resubscribe failed: {e:?}"
+                                                    );
+                                                }
+                                                Err(_) => {
+                                                    log::debug!(
+                                                        "{name}::{stream}: Camera stream resubscribe timed out"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
                                     Err(_) => {
                                         if sources_alive(&vid_src, &aud_src) {
                                             continue;
@@ -353,6 +455,7 @@ pub(super) async fn make_factory(
                                     &mut clock,
                                     &stream_config,
                                     &mut stats,
+                                    &mut need_keyframe,
                                 );
                                 if let Err(r) = &r {
                                     // Normal at teardown: the media was
@@ -361,6 +464,18 @@ pub(super) async fn make_factory(
                                     log::debug!("Failed to send to source: {r:?}");
                                 }
                                 r?;
+                                // An unprepared media leaves this bin in a
+                                // NULL pipeline where pushes still succeed
+                                // (as Flushing), so check after every frame
+                                // rather than only when the camera goes idle.
+                                // Otherwise this thread keeps the camera
+                                // stream open for a pipeline nobody plays.
+                                if sources_alive(&vid_src, &aud_src) {
+                                    was_live = true;
+                                } else if was_live {
+                                    log::debug!("{name}::{stream}: Pipeline gone; stopping");
+                                    break;
+                                }
                             }
                             log::trace!("All media recieved");
                             AnyResult::Ok(())
@@ -373,17 +488,34 @@ pub(super) async fn make_factory(
         AnyResult::Ok(())
     });
 
+    // gst-rtsp-server builds the element and then configures its media in one
+    // call, under the factory's media lock, so a single pending slot is enough
+    // to pair each pipeline with its media.
+    let pending_media: Arc<Mutex<Option<MediaSlot>>> = Default::default();
+    let callback_pending = pending_media.clone();
+
     // Now setup the factory
     let factory = NeoMediaFactory::new_with_callback(move |element| {
         let (reply, new_element) = std::sync::mpsc::sync_channel::<Element>(1);
+        let media = MediaSlot::default();
+        if let Ok(mut pending) = callback_pending.lock() {
+            pending.replace(media.clone());
+        }
         // try_send, not blocking_send: if the builder task is wedged we must
         // fail this client rather than block the shared client thread.
         client_tx
-            .try_send(ClientMsg::NewClient { element, reply })
+            .try_send(ClientMsg::NewClient {
+                element,
+                reply,
+                media,
+            })
             .map_err(|e| anyhow!("Pipeline builder is not accepting clients: {e}"))?;
 
         match new_element.recv_timeout(CLIENT_BUILD_TIMEOUT) {
             Ok(element) => Ok(Some(element)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(anyhow!("Pipeline builder gave up without a pipeline"))
+            }
             Err(e) => Err(anyhow!(
                 "Timed out after {}s waiting for the pipeline: {e}",
                 CLIENT_BUILD_TIMEOUT.as_secs()
@@ -391,6 +523,11 @@ pub(super) async fn make_factory(
         }
     })
     .await?;
+    factory.connect_media_configure(move |_, media| {
+        if let Some(slot) = pending_media.lock().ok().and_then(|mut p| p.take()) {
+            let _ = slot.set(media.downgrade());
+        }
+    });
     Ok((factory, thread))
 }
 
@@ -624,7 +761,9 @@ fn send_to_sources(
     clock: &mut MediaClock,
     stream_config: &StreamConfig,
     stats: &mut TsStats,
+    need_keyframe: &mut bool,
 ) -> AnyResult<()> {
+    let keyframe = matches!(data, BcMedia::Iframe(_));
     // Update TS
     match data {
         BcMedia::Aac(aac) => {
@@ -655,8 +794,13 @@ fn send_to_sources(
         }) => {
             let pts = clock.next_video(&stats.name);
             if let Some(vid_src) = vid_src.as_ref() {
-                log::trace!("Sending VID: {:?}", Duration::from_micros(pts));
-                send_to_appsrc(vid_src, data, Duration::from_micros(pts))?;
+                // A P-frame after a missing frame decodes against the wrong
+                // reference and smears until the next keyframe, so wait for
+                // that keyframe instead.
+                if keyframe || !*need_keyframe {
+                    log::trace!("Sending VID: {:?}", Duration::from_micros(pts));
+                    *need_keyframe = !send_to_appsrc(vid_src, data, Duration::from_micros(pts))?;
+                }
             }
             stats.note_video(microseconds, pts, stream_config.fps, clock);
         }
@@ -675,7 +819,8 @@ fn send_to_sources(
 /// grow without limit.
 const APPSRC_QUEUE_SLACK: u64 = 4;
 
-fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult<()> {
+/// Returns whether the frame was pushed; false when it was dropped.
+fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult<bool> {
     check_live(appsrc)?; // Stop if appsrc is dropped
 
     // In live mode we follow the advice in
@@ -691,11 +836,11 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
                 ts = Duration::from_micros(time.useconds());
             } else {
                 // Not playing
-                return Ok(());
+                return Ok(false);
             }
         } else {
             // Clock not up yet
-            return Ok(());
+            return Ok(false);
         }
     }
     // Don't let the appsrc queue grow without bound if the client stalls.
@@ -710,7 +855,7 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
             appsrc.current_level_bytes(),
             max_bytes,
         );
-        return Ok(());
+        return Ok(false);
     }
 
     // Hand the frame we already own straight to gstreamer.
@@ -736,7 +881,7 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
     };
 
     // Push buffer into the appsrc
-    match appsrc.push_buffer(buf) {
+    let pushed = match appsrc.push_buffer(buf) {
         Ok(_) => {
             // log::info!(
             //     "Send {}{} on {}",
@@ -744,7 +889,7 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
             //     if data.keyframe { " (keyframe)" } else { "" },
             //     appsrc.name()
             // );
-            Ok(())
+            Ok(true)
         }
         Err(FlowError::Flushing) => {
             // NOT "buffer full" - appsrc returns Flushing when the element is
@@ -759,7 +904,7 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
                     .and_then(|p| p.downcast::<Element>().ok())
                     .map(|p| p.current_state()),
             );
-            Ok(())
+            Ok(false)
         }
         Err(e) => Err(anyhow!("Error in streaming: {e:?}")),
     }?;
@@ -769,7 +914,7 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
     // PAUSED and released frames in bursts, which shows up as stutter-then-
     // catch-up in viewers. Smoothing is the downstream `queue` element's job;
     // it is bounded, so it cannot grow without limit the way this appsrc can.
-    Ok(())
+    Ok(pushed)
 }
 fn check_live(app: &AppSrc) -> Result<()> {
     app.bus().ok_or(anyhow!("App source is closed"))?;
@@ -883,6 +1028,9 @@ fn build_h264(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
 
     let payload = make_element("rtph264pay", "pay0")?;
+    // Repeat SPS and PPS with every IDR frame, so a client that joins or
+    // loses packets mid-stream can start decoding at the next keyframe.
+    payload.set_property("config-interval", -1i32);
     bin.add_many([&payload])?;
     Element::link_many([&linked.output, &payload])?;
     Ok(linked.appsrc)
@@ -934,6 +1082,8 @@ fn build_h265(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
 
     let payload = make_element("rtph265pay", "pay0")?;
+    // Repeat VPS, SPS and PPS with every IDR frame, as for H264.
+    payload.set_property("config-interval", -1i32);
     bin.add_many([&payload])?;
     Element::link_many([&linked.output, &payload])?;
     Ok(linked.appsrc)
