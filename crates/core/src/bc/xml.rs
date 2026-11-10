@@ -628,7 +628,7 @@ pub struct AlarmEventList {
 }
 
 /// An alarm event. Camera can send multiple per message as an array in AlarmEventList.
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
 pub struct AlarmEvent {
     /// XML Version
     #[serde(rename = "@version")]
@@ -636,9 +636,11 @@ pub struct AlarmEvent {
     /// The channel the event occured on. Usually zero unless from an NVR
     #[serde(rename = "channelId")]
     pub channel_id: u8,
-    /// Motion status. Known values are `"MD"` or `"none"`
+    /// Motion status. Known values are `"MD"`, `"visitor"` (doorbells) or `"none"`
     pub status: String,
-    /// AI status. Known values are `"people"` or `"none"`
+    /// AI status. A comma separated list such as `"people,vehicle"`. Known values are
+    /// `"people"`, `"vehicle"`, `"dog_cat"`, `"package"`, `"non-motor vehicle"`,
+    /// `"other"` or `"none"`. Older cameras omit it
     #[serde(rename = "AItype", skip_serializing_if = "Option::is_none")]
     pub ai_type: Option<String>,
     /// The recording status. Known values `0` or `1`

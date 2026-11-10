@@ -57,6 +57,15 @@ impl NeoRtspServer {
         auth.set_default_token(Some(&mut un_authtoken));
         factory.set_auth(Some(&auth));
 
+        // The default pool runs every client on one thread. Building a media
+        // can block that thread while a camera stream starts, which would
+        // stall clients of every other camera.
+        if let Some(pool) = factory.thread_pool() {
+            pool.set_max_threads(16);
+        } else {
+            log::warn!("RTSP server has no thread pool; clients share one thread");
+        }
+
         factory.connect_client_connected(|_, client| {
             client.connect_new_session(|_, session| {
                 log::debug!("New Session");

@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use Md5Trunc::*;
 
 mod abilityinfo;
+mod alarm;
 mod battery;
 mod connection;
 mod credentials;
@@ -43,6 +44,7 @@ mod uid;
 mod users;
 mod version;
 
+pub use alarm::AlarmData;
 pub(crate) use connection::*;
 pub use credentials::*;
 pub use errors::Error;
